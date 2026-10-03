@@ -1,0 +1,3 @@
+User-agent: *
+Disallow: /api/
+# Les pages HTML portent noindex ; autoriser leur lecture pour respecter cette directive.

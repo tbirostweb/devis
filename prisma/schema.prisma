@@ -1,0 +1,437 @@
+generator client {
+  provider = "prisma-client-js"
+}
+datasource db {
+  provider = "mysql"
+  url = env("DATABASE_URL")
+}
+model User {
+  id String @id @default(cuid())
+  email String @unique
+  name String
+  passwordHash String
+  createdAt DateTime @default(now())
+  totpSecret String @default("")
+  totpEnabled Boolean @default(false)
+  role String @default("admin")
+  referrerId String?
+  referrer Referrer? @relation(fields: [referrerId], references: [id], onDelete: SetNull)
+  sessions Session[]
+  activities ActivityLog[]
+  notifications Notification[]
+  @@index([referrerId])
+}
+model Session {
+  id String @id
+  userId String
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  csrf String
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+  @@index([expiresAt])
+}
+model Client {
+  id String @id @default(cuid())
+  name String
+  contact String @default("")
+  email String
+  phone String @default("")
+  address String @default(dbgenerated("('')")) @db.Text
+  siret String @default("")
+  status String @default("prospect")
+  notes String @default(dbgenerated("('')")) @db.Text
+  // Identifiant du client chez Abby. Par défaut une "organization" Abby (name requis) ;
+  // voir server/services/abby. Null tant que le client n'a pas été synchronisé.
+  abbyClientId String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  quotes Quote[]
+  projects Project[]
+  invoices Invoice[]
+  payments Payment[]
+  documents Document[]
+  subscriptions Subscription[]
+  activities ActivityLog[]
+  referrerId String?
+  referrer Referrer? @relation(fields: [referrerId], references: [id], onDelete: SetNull)
+  commissions Commission[]
+  @@index([status, name])
+  @@index([email])
+  @@index([referrerId])
+}
+model ServiceCategory {
+  id String @id @default(cuid())
+  name String @unique
+  services Service[]
+}
+model Service {
+  id String @id @default(cuid())
+  categoryId String
+  category ServiceCategory @relation(fields: [categoryId], references: [id], onDelete: Restrict)
+  name String
+  description String @default(dbgenerated("('')")) @db.Text
+  unitCents Int
+  pricing String @default("fixed")
+  frequency String @default("once")
+  indicative Boolean @default(false)
+  active Boolean @default(true)
+  includesMaintenance Boolean @default(false)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  @@index([categoryId, active])
+}
+model Quote {
+  id String @id @default(cuid())
+  reference String @unique
+  clientId String
+  client Client @relation(fields: [clientId], references: [id], onDelete: Restrict)
+  title String
+  status String @default("draft")
+  issuedDate String
+  validUntil String
+  depositBps Int @default(3000)
+  discountBps Int @default(0)
+  totalCents Int
+  recurringCents Int @default(0)
+  conditions String @default(dbgenerated("('')")) @db.Text
+  legalNotice String @default(dbgenerated("('')")) @db.Text
+  estimatedDelay String @default("")
+  proClient Boolean @default(false)
+  notes String @default(dbgenerated("('')")) @db.Text
+  notesOnPdf Boolean @default(false)
+  issuerSnapshot Json
+  clientSnapshot Json
+  items QuoteItem[]
+  project Project?
+  invoices Invoice[]
+  documents Document[]
+  activities ActivityLog[]
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  @@index([clientId, issuedDate])
+  @@index([status, validUntil])
+}
+model Project {
+  id String @id @default(cuid())
+  reference String @unique
+  clientId String
+  client Client @relation(fields: [clientId], references: [id], onDelete: Restrict)
+  quoteId String? @unique
+  quote Quote? @relation(fields: [quoteId], references: [id], onDelete: Restrict)
+  title String
+  status String @default("pending")
+  orderDate String
+  startDate String
+  dueDate String
+  totalCents Int
+  recurringCents Int @default(0)
+  depositBps Int @default(3000)
+  discountBps Int @default(0)
+  notes String @default(dbgenerated("('')")) @db.Text
+  items ProjectItem[]
+  invoices Invoice[]
+  payments Payment[]
+  documents Document[]
+  tasks Task[]
+  subscriptions Subscription[]
+  commissions Commission[]
+  activities ActivityLog[]
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  @@index([clientId, orderDate])
+  @@index([status, dueDate])
+}
+model Invoice {
+  id String @id @default(cuid())
+  reference String @unique
+  clientId String
+  client Client @relation(fields: [clientId], references: [id], onDelete: Restrict)
+  projectId String?
+  project Project? @relation(fields: [projectId], references: [id], onDelete: Restrict)
+  quoteId String?
+  quote Quote? @relation(fields: [quoteId], references: [id], onDelete: Restrict)
+  title String
+  kind String @default("final")
+  status String @default("draft")
+  issuedDate String
+  dueDate String
+  discountBps Int @default(0)
+  totalCents Int
+  conditions String @default(dbgenerated("('')")) @db.Text
+  legalNotice String @default(dbgenerated("('')")) @db.Text
+  proClient Boolean @default(false)
+  issuerSnapshot Json
+  clientSnapshot Json
+  // Facturation Abby : Abby est la source de vérité pour les factures émises via Abby.
+  abbyInvoiceId String? @unique
+  abbyNumber String? // numéro officiel attribué par Abby à la finalisation
+  abbyStatus String? // état Abby : draft|finalized|signed|refused|paid
+  abbyTest Boolean? // flag `test` du compte Abby (true = document non légal)
+  // Clé d'idempotence : une seule facture Abby par devis (anti double-clic/doublon).
+  abbyQuoteKey String? @unique
+  abbyPdfFetchedAt DateTime?
+  lastSyncedAt DateTime?
+  items InvoiceItem[]
+  payments Payment[]
+  commissions Commission[]
+  documents Document[]
+  activities ActivityLog[]
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  @@index([clientId, issuedDate])
+  @@index([status, dueDate])
+  @@index([projectId])
+}
+model Payment {
+  id String @id @default(cuid())
+  clientId String
+  client Client @relation(fields: [clientId], references: [id], onDelete: Restrict)
+  projectId String?
+  project Project? @relation(fields: [projectId], references: [id], onDelete: Restrict)
+  invoiceId String?
+  invoice Invoice? @relation(fields: [invoiceId], references: [id], onDelete: Restrict)
+  amountCents Int
+  date String
+  method String
+  reference String @default("")
+  comment String @default(dbgenerated("('')")) @db.Text
+  requestKey String @unique
+  createdAt DateTime @default(now())
+  @@index([clientId, date])
+  @@index([projectId])
+  @@index([invoiceId])
+  @@index([date])
+}
+model Expense {
+  id String @id @default(cuid())
+  supplier String
+  date String
+  dueDate String
+  netCents Int
+  vatBps Int @default(0)
+  totalCents Int
+  category String
+  paid Boolean @default(true)
+  method String @default("transfer")
+  comment String @default(dbgenerated("('')")) @db.Text
+  documents Document[]
+  commission Commission?
+  createdAt DateTime @default(now())
+  @@index([date, category])
+  @@index([paid, dueDate])
+}
+model Document {
+  id String @id @default(cuid())
+  name String
+  mime String
+  size Int
+  storageKey String @unique
+  clientId String?
+  client Client? @relation(fields: [clientId], references: [id], onDelete: Restrict)
+  quoteId String?
+  quote Quote? @relation(fields: [quoteId], references: [id], onDelete: Restrict)
+  projectId String?
+  project Project? @relation(fields: [projectId], references: [id], onDelete: Restrict)
+  invoiceId String?
+  invoice Invoice? @relation(fields: [invoiceId], references: [id], onDelete: Restrict)
+  expenseId String?
+  expense Expense? @relation(fields: [expenseId], references: [id], onDelete: Restrict)
+  referrerId String?
+  referrer Referrer? @relation(fields: [referrerId], references: [id], onDelete: Restrict)
+  createdAt DateTime @default(now())
+  @@index([clientId])
+  @@index([projectId])
+  @@index([quoteId])
+  @@index([invoiceId])
+  @@index([expenseId])
+  @@index([referrerId])
+}
+model Task {
+  id String @id @default(cuid())
+  projectId String
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  title String
+  done Boolean @default(false)
+  position Int @default(0)
+  dueDate String?
+}
+model Subscription {
+  id String @id @default(cuid())
+  clientId String
+  client Client @relation(fields: [clientId], references: [id], onDelete: Restrict)
+  projectId String?
+  project Project? @relation(fields: [projectId], references: [id], onDelete: Restrict)
+  name String
+  category String
+  amountCents Int
+  vatBps Int @default(0)
+  frequency String @default("monthly")
+  startDate String
+  nextDate String
+  endDate String?
+  active Boolean @default(true)
+  @@index([clientId, active])
+  @@index([nextDate])
+}
+model Notification {
+  id String @id @default(cuid())
+  userId String
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  key String
+  readAt DateTime @default(now())
+  @@unique([userId, key])
+}
+model ActivityLog {
+  id String @id @default(cuid())
+  userId String?
+  user User? @relation(fields: [userId], references: [id], onDelete: SetNull)
+  action String
+  entity String
+  entityId String
+  clientId String?
+  client Client? @relation(fields: [clientId], references: [id], onDelete: Restrict)
+  quoteId String?
+  quote Quote? @relation(fields: [quoteId], references: [id], onDelete: Restrict)
+  projectId String?
+  project Project? @relation(fields: [projectId], references: [id], onDelete: Restrict)
+  invoiceId String?
+  invoice Invoice? @relation(fields: [invoiceId], references: [id], onDelete: Restrict)
+  createdAt DateTime @default(now())
+  @@index([createdAt])
+  @@index([clientId])
+  @@index([projectId])
+  @@index([quoteId])
+  @@index([invoiceId])
+}
+model Settings {
+  id String @id @default("company")
+  data Json
+}
+model Counter {
+  key String @id
+  value Int @default(0)
+}
+model CalendarEntry {
+  id String @id @default(cuid())
+  source String @default("manual")
+  title String
+  detail String? @db.Text
+  date String
+  time String?
+  endTime String?
+  status String?
+  externalId String? @unique
+  attendeeName String?
+  attendeeEmail String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  @@index([date, source])
+}
+
+model QuoteItem {
+  id String @id @default(cuid())
+  quoteId String
+  quote Quote @relation(fields: [quoteId], references: [id], onDelete: Cascade)
+  name String
+  description String @default(dbgenerated("('')")) @db.Text
+  category String
+  section String @default("Prestations")
+  quantityMilli Int @default(1000)
+  unitCents Int
+  discountBps Int @default(0)
+  vatBps Int @default(0)
+  frequency String @default("once")
+  optional Boolean @default(false)
+  selected Boolean @default(true)
+  position Int @default(0)
+  @@index([quoteId])
+}
+
+model ProjectItem {
+  id String @id @default(cuid())
+  projectId String
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  name String
+  description String @default(dbgenerated("('')")) @db.Text
+  category String
+  section String @default("Prestations")
+  quantityMilli Int @default(1000)
+  unitCents Int
+  discountBps Int @default(0)
+  vatBps Int @default(0)
+  frequency String @default("once")
+  optional Boolean @default(false)
+  selected Boolean @default(true)
+  position Int @default(0)
+  @@index([projectId])
+}
+
+model InvoiceItem {
+  id String @id @default(cuid())
+  invoiceId String
+  invoice Invoice @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+  name String
+  description String @default(dbgenerated("('')")) @db.Text
+  category String
+  section String @default("Prestations")
+  quantityMilli Int @default(1000)
+  unitCents Int
+  discountBps Int @default(0)
+  vatBps Int @default(0)
+  frequency String @default("once")
+  optional Boolean @default(false)
+  selected Boolean @default(true)
+  position Int @default(0)
+  @@index([invoiceId])
+}
+
+model Referrer {
+  id String @id @default(cuid())
+  name String
+  email String @default("")
+  phone String @default("")
+  address String @default(dbgenerated("('')")) @db.Text
+  siret String @default("")
+  iban String @default("")
+  status String @default("occasional")
+  conventionDate String @default("")
+  notes String @default(dbgenerated("('')")) @db.Text
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  clients Client[]
+  commissions Commission[]
+  documents Document[]
+  users User[]
+  @@index([status, name])
+}
+
+model Commission {
+  id String @id @default(cuid())
+  referrerId String
+  referrer Referrer @relation(fields: [referrerId], references: [id], onDelete: Restrict)
+  clientId String
+  client Client @relation(fields: [clientId], references: [id], onDelete: Restrict)
+  projectId String?
+  project Project? @relation(fields: [projectId], references: [id], onDelete: Restrict)
+  invoiceId String?
+  invoice Invoice? @relation(fields: [invoiceId], references: [id], onDelete: Restrict)
+  expenseId String? @unique
+  expense Expense? @relation(fields: [expenseId], references: [id], onDelete: Restrict)
+  label String @default("")
+  baseCents Int
+  rateBps Int
+  amountCents Int
+  status String @default("awaiting")
+  date String
+  paidDate String?
+  method String @default("transfer")
+  reference String @default("")
+  notes String @default(dbgenerated("('')")) @db.Text
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  @@index([referrerId, date])
+  @@index([status, date])
+  @@index([clientId])
+  @@index([projectId])
+  @@index([invoiceId])
+}

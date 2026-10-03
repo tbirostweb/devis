@@ -1,0 +1,10 @@
+node_modules
+.env
+.env.*
+!.env.example
+storage
+dist
+.git
+tmp
+ACCES-LOCAL.md
+tests

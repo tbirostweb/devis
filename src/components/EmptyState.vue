@@ -1,0 +1,1 @@
+<script setup>import Icon from './Icon.vue';defineProps({title:{type:String,default:'Rien ici pour le moment.'},description:{type:String,default:'Ajoutez votre premier élément pour commencer.'}});</script><template><div class="empty-state"><Icon name="FolderOpen" :size="30"/><h3>{{title}}</h3><p>{{description}}</p><slot/></div></template>

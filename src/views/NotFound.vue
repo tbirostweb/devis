@@ -1,0 +1,1 @@
+<template><main class="public-page"><span class="eyebrow accent">ERREUR 404</span><h1>PAGE INTROUVABLE.</h1><p>Cette adresse n’existe pas ou a changé.</p><RouterLink to="/" class="btn primary">Revenir au studio</RouterLink></main></template>
