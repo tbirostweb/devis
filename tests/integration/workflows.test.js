@@ -45,7 +45,9 @@ test('Quote totals are server-calculated and price snapshots survive catalogue e
   const row=await ok('/quotes/'+quote.id);assert.equal(row.items[0].unitCents,99900);
   assert.equal((await call('/quotes/'+quote.id+'/status',{method:'PATCH',body:{status:'accepted'}})).status,409);
   await ok('/quotes/'+quote.id+'/status',{method:'PATCH',body:{status:'sent'}});await ok('/quotes/'+quote.id+'/status',{method:'PATCH',body:{status:'accepted'}});
-  assert.equal((await call('/quotes/'+quote.id,{method:'PUT',body:quoteBody()})).status,409);
+  // Un devis accepté reste désormais modifiable (sans facture officielle) et conserve son statut.
+  const editedQuote=await call('/quotes/'+quote.id,{method:'PUT',body:quoteBody()});assert.equal(editedQuote.status,200,JSON.stringify(editedQuote.data));
+  assert.equal((await ok('/quotes/'+quote.id)).status,'accepted');
 });
 test('Concurrent quote conversion is idempotent and preserves all project lines',async()=>{
   const results=await Promise.all([call('/quotes/'+quote.id+'/convert',{method:'POST',body:{}}),call('/quotes/'+quote.id+'/convert',{method:'POST',body:{}})]);for(const r of results)assert.equal(r.status,200,JSON.stringify(r.data));assert.equal(results[0].data.id,results[1].data.id);project=results[0].data;

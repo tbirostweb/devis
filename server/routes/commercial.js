@@ -14,6 +14,21 @@ export function invoiceStatus(i) {
     return paid >= i.totalCents ? 'paid' : i.dueDate < today() ? 'overdue' : paid > 0 ? 'partial' : 'sent';
 }
 export function quoteStatus(q) { return ['sent', 'viewed'].includes(q.status) && q.validUntil < today() ? 'expired' : q.status; }
+// Une facture « officielle » verrouille l'édition du devis : facture Abby finalisée (numéro officiel
+// attribué ou état Abby autre que « draft »), ou facture interne émise (statut ni brouillon ni annulé).
+export function invoiceLocksQuote(i) {
+    if (i.abbyInvoiceId || i.abbyStatus)
+        return !!i.abbyNumber || (!!i.abbyStatus && i.abbyStatus !== 'draft');
+    return !['draft', 'cancelled'].includes(i.status);
+}
+// Une facture encore en brouillon n'empêche pas l'édition mais justifie un avertissement :
+// les modifications du devis ne sont pas répercutées automatiquement sur ce brouillon.
+export function invoiceDraftPending(i) {
+    if (i.abbyInvoiceId || i.abbyStatus)
+        return i.abbyStatus === 'draft';
+    return i.status === 'draft';
+}
+export const quoteDraftInvoiceWarning = 'Une facture brouillon existe déjà pour ce devis ; vos modifications ne la mettent pas à jour automatiquement.';
 export async function commercial(app) {
     app.get('/api/quotes', async (req) => {
         const q = querySchema.parse(req.query);
@@ -22,7 +37,7 @@ export async function commercial(app) {
         const [rows, count] = await Promise.all([db.quote.findMany({ where, include: { client: true, project: true, items: true }, orderBy: { createdAt: 'desc' }, skip: (q.page - 1) * q.limit, take: q.limit }), db.quote.count({ where })]);
         return { rows: rows.map(r => ({ ...r, status: quoteStatus(r) })), count, page: q.page };
     });
-    app.get('/api/quotes/:id', async (req) => { const q = found(await db.quote.findUnique({ where: params.parse(req.params), include: { client: true, items: { orderBy: { position: 'asc' } }, project: true, documents: true, activities: { orderBy: { createdAt: 'desc' }, take: 100 } } })); return { ...q, status: quoteStatus(q) }; });
+    app.get('/api/quotes/:id', async (req) => { const q = found(await db.quote.findUnique({ where: params.parse(req.params), include: { client: true, items: { orderBy: { position: 'asc' } }, project: true, documents: true, invoices: { orderBy: { createdAt: 'desc' } }, activities: { orderBy: { createdAt: 'desc' }, take: 100 } } })); return { ...q, status: quoteStatus(q), invoiceLock: q.invoices.some(invoiceLocksQuote), invoiceDraftPending: !q.invoices.some(invoiceLocksQuote) && q.invoices.some(invoiceDraftPending) }; });
     app.post('/api/quotes', async (req) => transaction(async (tx) => {
         const b = quoteSchema.parse(req.body), settings = await company(tx), client = found(await tx.client.findUnique({ where: { id: b.clientId } }));
         if (client.status === 'archived')
@@ -34,13 +49,16 @@ export async function commercial(app) {
         return q;
     }));
     app.put('/api/quotes/:id', async (req) => transaction(async (tx) => {
-        const { id } = params.parse(req.params), old = found(await tx.quote.findUnique({ where: { id } }));
-        if (old.status !== 'draft')
-            throw new HttpError(409, 'Seul un brouillon peut être modifié. Dupliquez le devis pour le réviser.');
+        const { id } = params.parse(req.params), old = found(await tx.quote.findUnique({ where: { id }, include: { invoices: true } }));
+        // Garde-fou : un devis ayant donné lieu à une facture officielle ne peut plus être modifié.
+        const official = old.invoices.find(invoiceLocksQuote);
+        if (official)
+            throw new HttpError(409, `Ce devis a déjà donné lieu à une facture officielle (N° ${official.abbyNumber || official.reference}). Il ne peut plus être modifié.`);
         const b = quoteSchema.parse(req.body), { items, ...data } = b, calc = totals(items, b.discountBps, b.depositBps), client = found(await tx.client.findUnique({ where: { id: b.clientId } }));
+        // Le statut n'est jamais fourni par quoteSchema : il est donc conservé tel quel (pas de retour en brouillon).
         const q = await tx.quote.update({ where: { id }, data: { ...data, totalCents: calc.total, recurringCents: calc.mrr, clientSnapshot: snapshot(client), issuerSnapshot: await company(tx), items: { deleteMany: {}, create: items } } });
-        await audit(tx, req.user.id, `Brouillon enregistré · ${q.reference}`, 'quotes', id, { clientId: q.clientId, quoteId: id });
-        return q;
+        await audit(tx, req.user.id, `Devis modifié · ${q.reference}`, 'quotes', id, { clientId: q.clientId, quoteId: id });
+        return old.invoices.some(invoiceDraftPending) ? { ...q, warning: quoteDraftInvoiceWarning } : q;
     }));
     app.post('/api/quotes/:id/duplicate', async (req) => transaction(async (tx) => {
         const q = found(await tx.quote.findUnique({ where: params.parse(req.params), include: { items: true } })), settings = await company(tx);

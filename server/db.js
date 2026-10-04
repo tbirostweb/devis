@@ -1,6 +1,10 @@
 import 'dotenv/config';
 import { PrismaClient, Prisma } from '@prisma/client';
-export const db = new PrismaClient();
+import { protectIbans } from './iban.js';
+export const db = new PrismaClient().$extends({ query: { $allModels: { async $allOperations({args,query}) {
+    for (const field of ['data','create','update']) if (args[field]) args[field] = protectIbans(args[field], true);
+    return protectIbans(await query(args), false);
+} } } });
 export async function transaction(work) {
     for (let attempt = 0;; attempt++) {
         try {

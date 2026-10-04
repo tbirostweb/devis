@@ -1,3 +1,4 @@
+import { scheduleRetention } from './retention.js';
 import 'dotenv/config';
 import Fastify from 'fastify';
 import cookie from '@fastify/cookie';
@@ -81,4 +82,5 @@ if (existsSync(resolve('dist/index.html'))) {
 for (const signal of ['SIGTERM', 'SIGINT'])
     process.on(signal, async () => { await app.close(); await db.$disconnect(); process.exit(0); });
 await app.listen({ port: Number(process.env.PORT || 3001), host: prod ? '0.0.0.0' : '127.0.0.1' });
+scheduleRetention(db, app.log);
 app.log.info('Birostweb API démarrée');
