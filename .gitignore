@@ -50,3 +50,5 @@ coverage/
 **/outputs/
 **/logs/
 **/backups/
+.idea/
+.vscode/

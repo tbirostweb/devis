@@ -31,17 +31,26 @@ function hotp(secret, counter) {
     return String(bin % 1_000_000).padStart(6, '0');
 }
 // Fenêtre ±1 pas (30 s) pour tolérer une petite dérive d'horloge. Comparaison à temps constant.
-export function verifyTotp(secretBase32, token, atMs = Date.now(), window = 1) {
-    if (!secretBase32 || !/^\d{6}$/.test(String(token ?? ''))) return false;
-    let secret; try { secret = base32Decode(secretBase32); } catch { return false; }
+// Renvoie le pas (counter) correspondant au code, ou null. L'appelant DOIT mémoriser ce pas
+// (voir consumeTotp dans auth.js) pour refuser tout rejeu du même code ou d'un code antérieur.
+export function matchTotpCounter(secretBase32, token, atMs = Date.now(), window = 1) {
+    if (!secretBase32 || !/^\d{6}$/.test(String(token ?? ''))) return null;
+    let secret; try { secret = base32Decode(secretBase32); } catch { return null; }
     const counter = Math.floor(atMs / 1000 / 30);
+    const provided = Buffer.from(String(token));
+    let matched = null;
     for (let i = -window; i <= window; i++) {
         const candidate = Buffer.from(hotp(secret, counter + i));
-        const provided = Buffer.from(String(token));
-        if (candidate.length === provided.length && timingSafeEqual(candidate, provided)) return true;
+        if (candidate.length === provided.length && timingSafeEqual(candidate, provided) && matched === null) matched = counter + i;
     }
-    return false;
+    return matched;
 }
+export function verifyTotp(secretBase32, token, atMs = Date.now(), window = 1) {
+    return matchTotpCounter(secretBase32, token, atMs, window) !== null;
+}
+// Code attendu pour un pas donné (tests et outils d'exploitation uniquement).
+export function totpAt(secretBase32, counter) { return hotp(base32Decode(secretBase32), counter); }
+export const currentCounter = (atMs = Date.now()) => Math.floor(atMs / 1000 / 30);
 export function otpauthURL(secretBase32, account, issuer = 'Birostweb') {
     const label = encodeURIComponent(`${issuer}:${account}`);
     const params = new URLSearchParams({ secret: secretBase32, issuer, algorithm: 'SHA1', digits: '6', period: '30' });

@@ -18,14 +18,16 @@ PORT=3001
 APP_ORIGIN=https://studio.votre-domaine.fr
 DATABASE_URL=mysql://birostweb:MOT_DE_PASSE_ENCODE@HOTE_MYSQL_INTERNE:3306/birostweb
 STORAGE_PATH=/app/storage
-TRUST_PROXY=true
+TRUST_PROXY=IP_OU_CIDR_DU_PROXY_TRAEFIK
+TOTP_ENCRYPTION_KEY=sortie-de-openssl-rand-hex-32
+CALCOM_WEBHOOK_SECRET=secret-partage-avec-cal-com
 ADMIN_EMAIL=votre-email@birostweb.fr
 ADMIN_PASSWORD=un-mot-de-passe-long-unique-de-14-caracteres-minimum
 INITIALIZE_ADMIN=true
 SEED_DEMO=false
 ```
 
-Encoder les caractères réservés du mot de passe dans l'URL MySQL (par exemple `@` → `%40`, `#` → `%23`). `APP_ORIGIN` doit correspondre exactement à l'adresse HTTPS du navigateur, sans slash final. `TRUST_PROXY=true` suppose que seul le proxy Dokploy peut joindre le service : ne pas publier son port directement sur Internet. Une seule réplique applicative est prévue ; sessions persistées en MySQL, limitation des tentatives en mémoire du processus.
+Encoder les caractères réservés du mot de passe dans l'URL MySQL (par exemple `@` → `%40`, `#` → `%23`). `APP_ORIGIN` doit correspondre exactement à l'adresse HTTPS du navigateur, sans slash final. `TRUST_PROXY` doit lister l'IP ou le sous-réseau du proxy Traefik/Dokploy (relever le réseau Docker réel) ; `true` reste accepté mais fait confiance à toute adresse et déclenche un avertissement. Ne pas publier le port du service directement sur Internet. `TOTP_ENCRYPTION_KEY` est obligatoire en production (le démarrage échoue sinon) : la conserver dans Dokploy et dans le gestionnaire de secrets, jamais dans les sauvegardes de base. Une seule réplique applicative est prévue ; sessions persistées en MySQL, limitation des tentatives en mémoire du processus.
 
 ## 3. Persister les fichiers
 
@@ -34,6 +36,8 @@ Ajouter un **volume nommé** Dokploy monté sur `/app/storage`, inscriptible par
 ## 4. Premier déploiement
 
 Déployer. Le démarrage applique `prisma migrate deploy`, puis initialise le compte admin et le catalogue si `INITIALIZE_ADMIN=true`. Il ne remplace jamais le mot de passe d'un compte existant. Aucune donnée de démonstration n'est ajoutée en production.
+
+À la première connexion, l'administrateur doit activer la double authentification (mot de passe redemandé, code TOTP, puis 10 codes de secours à conserver hors ligne) : aucune donnée métier n'est accessible avant. En cas de perte du téléphone, se connecter avec un code de secours, désactiver puis réactiver la 2FA. Si tous les codes sont perdus, la remise à zéro se fait par l'exploitant en base (`totpEnabled=false`, `totpSecret=''`) après vérification d'identité hors bande, puis réenrôlement immédiat.
 
 Après la première connexion, passer `INITIALIZE_ADMIN=false` et retirer `ADMIN_PASSWORD` de Dokploy. Garder l'adresse de connexion en lieu sûr. Renseigner l'identité, l'adresse, le SIRET, les coordonnées bancaires et les mentions adaptées dans **Paramètres**. L'émission de facture requiert une adresse et un SIRET renseignés.
 
@@ -44,6 +48,8 @@ La vérification de santé Docker utilise `/api/health` et contrôle aussi l'acc
 Les déploiements suivants reconstruisent les assets et appliquent uniquement les migrations manquantes. Conserver les volumes MySQL et documents. Ne jamais exécuter `prisma migrate reset` en production.
 
 Sauvegarder ensemble : (1) un dump MySQL cohérent avec `mysqldump --single-transaction --routines --triggers`, (2) le volume `/app/storage`, (3) la configuration des variables dans votre gestionnaire de secrets. Chiffrer les sauvegardes, conserver plusieurs générations et vérifier une restauration sur un environnement isolé. Dokploy permet de planifier les sauvegardes du service de base de données ; sauvegarder séparément le volume documentaire.
+
+La migration `202610040001_security_hardening` est additive (colonnes nullables et table des codes de secours, aucune suppression) ; les secrets TOTP existants en clair sont rechiffrés automatiquement à leur prochaine utilisation.
 
 Avant une migration : sauvegarder, déployer une seule version à la fois, consulter les journaux et vérifier connexion, dossier client, PDF et pièce jointe. Le retour à une ancienne image ne restaure pas automatiquement le schéma MySQL ; prévoir une restauration si la migration est incompatible.
 

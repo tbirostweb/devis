@@ -5,10 +5,11 @@ import {spawn,execFileSync} from 'node:child_process';
 import {mkdirSync,writeFileSync} from 'node:fs';
 import {randomUUID} from 'node:crypto';
 import {today,addDays} from '../../server/db.js';
+import {enrollTotp,testTotpKey} from './totp-helper.js';
 const originalUrl=new URL(process.env.DATABASE_URL);
 const testUrl=new URL(process.env.TEST_DATABASE_URL||originalUrl);if(!process.env.TEST_DATABASE_URL)testUrl.pathname='/birostweb_test';
 if(testUrl.pathname!=='/birostweb_test'||process.env.NODE_ENV==='production')throw new Error('Tests require a dedicated database named birostweb_test, outside production.');
-const env={...process.env,NODE_ENV:'test',DATABASE_URL:testUrl.toString(),SEED_DEMO:'false',STORAGE_PATH:'./tmp/test-storage',PORT:'3202',APP_ORIGIN:'http://127.0.0.1:3202',ADMIN_EMAIL:'test-admin@birostweb.example',ADMIN_PASSWORD:randomUUID()+randomUUID()};
+const env={...process.env,NODE_ENV:'test',DATABASE_URL:testUrl.toString(),SEED_DEMO:'false',STORAGE_PATH:'./tmp/test-storage',PORT:'3202',APP_ORIGIN:'http://127.0.0.1:3202',ADMIN_EMAIL:'test-admin@birostweb.example',ADMIN_PASSWORD:randomUUID()+randomUUID(),TOTP_ENCRYPTION_KEY:testTotpKey()};
 const base='http://127.0.0.1:3202/api',origin=env.APP_ORIGIN;let child,logs='',cookie='',csrf='',client,other,category,service,quote,project,invoice,expense,document,subscription,referrer,commission;const now=today();
 async function call(path,{method='GET',body,headers={},anonymous=false}={}){const form=body instanceof FormData;const response=await fetch(base+path,{method,headers:{origin,...(!anonymous?{cookie,'x-csrf-token':csrf}:{}),...(!form&&body?{'content-type':'application/json'}:{}),...headers},body:body?(form?body:JSON.stringify(body)):undefined});const json=response.headers.get('content-type')?.includes('application/json');const data=json?await response.json():Buffer.from(await response.arrayBuffer());return {status:response.status,data,headers:response.headers};}
 async function ok(path,opts){const r=await call(path,opts);assert.equal(r.status,200,`${path}: ${JSON.stringify(r.data)}`);return r.data;}
@@ -19,6 +20,7 @@ before(async()=>{
   child=spawn(process.execPath,['server/index.js'],{env,stdio:['ignore','pipe','pipe']});child.stdout.on('data',d=>logs+=d);child.stderr.on('data',d=>logs+=d);
   let ready=false;for(let i=0;i<60;i++){try{if((await fetch(base+'/health')).ok){ready=true;break;}}catch{}await new Promise(r=>setTimeout(r,150));}if(!ready)throw new Error(logs.slice(-3000));
   const login=await call('/auth/login',{method:'POST',anonymous:true,body:{email:env.ADMIN_EMAIL,password:env.ADMIN_PASSWORD}});assert.equal(login.status,200,JSON.stringify(login.data));cookie=login.headers.get('set-cookie').split(';')[0];csrf=login.data.csrf;
+  await enrollTotp(call,env.ADMIN_PASSWORD); // 2FA administrateur obligatoire avant tout accès métier
 });
 after(async()=>{if(child){child.kill('SIGTERM');await new Promise(resolve=>{if(child.exitCode!==null)return resolve();child.once('exit',resolve);});}});
 test('Private APIs, files and mutations enforce session, Origin and CSRF',async()=>{

@@ -34,6 +34,30 @@ function fromBooking(payload) {
     };
 }
 
+// Horodatage de l'événement (champ `createdAt` du corps signé Cal.com). Fenêtre de fraîcheur anti-rejeu :
+// un événement signé trop ancien (ou daté du futur) est refusé. Fenêtre réglable par CALCOM_WEBHOOK_TOLERANCE_SECONDS.
+export function eventTimestamp(body, now = Date.now()) {
+    const at = body.createdAt ? new Date(body.createdAt) : null;
+    if (!at || isNaN(at)) throw new HttpError(400, 'Horodatage de l’événement absent.');
+    const tolerance = Number(process.env.CALCOM_WEBHOOK_TOLERANCE_SECONDS || 600) * 1000;
+    if (now - at.getTime() > tolerance || at.getTime() - now > 5 * 60 * 1000)
+        throw new HttpError(400, 'Événement hors de la fenêtre de validité (rejeu refusé).');
+    return at;
+}
+// Applique un événement seulement s'il est plus récent que le dernier appliqué (ordre monotone, transaction
+// sérialisable) : un rejeu ou un ancien BOOKING_CREATED reçu après une annulation n'a aucun effet.
+async function applyInOrder(uid, eventAt, update, create = update) {
+    return transaction(async (tx) => {
+        const existing = await tx.calendarEntry.findUnique({ where: { externalId: uid } });
+        if (existing) {
+            if (existing.lastEventAt && existing.lastEventAt >= eventAt) return { ok: true, ignored: 'stale' };
+            await tx.calendarEntry.update({ where: { externalId: uid }, data: update });
+        }
+        else if (create) await tx.calendarEntry.create({ data: create });
+        return { ok: true };
+    });
+}
+
 export async function calendar(app) {
     // --- Webhook public Cal.com : scope encapsulé avec un parser de corps BRUT dédié. ---
     // Fastify consomme le corps en le parsant ; on enregistre ici un parser JSON qui conserve
@@ -47,17 +71,21 @@ export async function calendar(app) {
         });
         scope.post('/api/webhooks/cal-com', { config: { rateLimit: { max: 60, timeWindow: '1 minute' } } }, async (req) => {
             verifySignature(req);
-            const body = z.object({ triggerEvent: z.string(), payload: z.object({ uid: z.string().min(1) }).passthrough() }).parse(req.body);
+            const body = z.object({ triggerEvent: z.string(), createdAt: z.string().optional(), payload: z.object({ uid: z.string().min(1) }).passthrough() }).parse(req.body);
             const { triggerEvent, payload } = body;
             const uid = payload.uid;
+            const eventAt = eventTimestamp(body);
             if (triggerEvent === 'BOOKING_CREATED' || triggerEvent === 'BOOKING_RESCHEDULED') {
                 const mapped = fromBooking(payload);
                 if (!mapped.date) throw new HttpError(400, 'Date de réservation absente.');
-                const data = { source: 'calcom', status: 'confirmed', externalId: uid, ...mapped };
-                // Idempotent : la clé unique externalId dédoublonne les rejeux et les reprogrammations.
-                await db.calendarEntry.upsert({ where: { externalId: uid }, create: data, update: data });
-            } else if (triggerEvent === 'BOOKING_CANCELLED' || triggerEvent === 'BOOKING_REJECTED') {
-                await db.calendarEntry.updateMany({ where: { externalId: uid }, data: { status: 'cancelled' } });
+                const data = { source: 'calcom', status: 'confirmed', externalId: uid, lastEventAt: eventAt, ...mapped };
+                return applyInOrder(uid, eventAt, data);
+            }
+            if (triggerEvent === 'BOOKING_CANCELLED' || triggerEvent === 'BOOKING_REJECTED') {
+                const mapped = fromBooking(payload);
+                // Annulation reçue avant la création (ordre inversé) : on conserve une entrée annulée si la date
+                // est connue, pour qu'un BOOKING_CREATED plus ancien ne puisse pas la « réactiver » ensuite.
+                return applyInOrder(uid, eventAt, { status: 'cancelled', lastEventAt: eventAt }, mapped.date ? { source: 'calcom', externalId: uid, ...mapped, status: 'cancelled', lastEventAt: eventAt } : null);
             }
             // Autres triggers : acquittés sans effet (idempotent).
             return { ok: true };

@@ -2,21 +2,65 @@ import { randomBytes, createHash, timingSafeEqual } from 'node:crypto';
 import argon2 from 'argon2';
 import { z } from 'zod';
 import { db, HttpError } from './db.js';
-import { generateSecret, verifyTotp, otpauthURL } from './totp.js';
+import { generateSecret, matchTotpCounter, otpauthURL } from './totp.js';
+import { sealSecret, openSecret, isSealed, totpKey } from './secrets.js';
 import { isPwned } from './pwned.js';
 import { profileSchema, emailChangeSchema } from '../shared/contracts.js';
 const hash = (s) => createHash('sha256').update(s).digest('hex');
 const prod = process.env.NODE_ENV === 'production';
 const cookieName = prod ? '__Host-bw_session' : 'bw_session';
 const cookieOptions = { httpOnly: true, secure: prod, sameSite: 'lax', path: '/', maxAge: 60 * 60 * 12 };
-const loginSchema = z.object({ email: z.email().transform(s => s.toLowerCase()), password: z.string().min(1).max(256), token: z.string().regex(/^\d{6}$/).optional() });
+const totpToken = z.string().regex(/^\d{6}$/, 'Code à 6 chiffres attendu.');
+// Code de secours : 10 caractères base32 (affichés XXXXX-XXXXX), ~50 bits d'entropie, usage unique.
+const recoveryCode = z.string().trim().max(32).transform(s => s.toUpperCase().replace(/[^A-Z2-7]/g, '')).pipe(z.string().length(10, 'Code de secours invalide.'));
+const loginSchema = z.object({ email: z.email().transform(s => s.toLowerCase()), password: z.string().min(1).max(256), token: totpToken.optional(), recoveryCode: recoveryCode.optional() });
 const loginWindows = new Map();
+// Quota par utilisateur (et non par IP) pour les opérations sensibles du compte : évalué après l'authentification.
+export const perUserLimit = { rateLimit: { max: 5, timeWindow: '15 minutes', hook: 'preHandler', keyGenerator: (req) => 'user:' + (req.user?.id ?? req.ip) } };
+// Chemins accessibles à un administrateur qui n'a pas encore activé la double authentification.
+const ENROLLMENT_PATHS = new Set(['/api/auth/me', '/api/auth/logout', '/api/auth/password', '/api/auth/profile', '/api/auth/2fa/setup', '/api/auth/2fa/enable']);
+const RECOVERY_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
 function checkOrigin(req) {
     const origin = req.headers.origin;
     const expected = process.env.APP_ORIGIN || 'http://127.0.0.1:5184';
     const allowed = [expected];
     if (!origin || !allowed.includes(origin))
         throw new HttpError(403, 'Origine de la requête refusée.');
+}
+export function newRecoveryCodes(count = 10) {
+    return Array.from({ length: count }, () => {
+        const bytes = randomBytes(10);
+        const raw = Array.from(bytes, b => RECOVERY_ALPHABET[b & 31]).join('');
+        return raw.slice(0, 5) + '-' + raw.slice(5);
+    });
+}
+export const recoveryHash = (code) => hash('recovery:' + code.toUpperCase().replace(/[^A-Z2-7]/g, ''));
+// Vérifie un code TOTP ET consomme atomiquement son pas : un code (ou un code plus ancien) ne sert qu'une fois,
+// y compris en cas de requêtes concurrentes (UPDATE conditionnel, une seule ligne modifiée gagne).
+export async function consumeTotp(user, token, client = db) {
+    const secret = openSecret(user.totpSecret);
+    const counter = matchTotpCounter(secret, token);
+    if (counter === null) return false;
+    const claimed = await client.user.updateMany({ where: { id: user.id, OR: [{ totpLastCounter: null }, { totpLastCounter: { lt: counter } }] }, data: { totpLastCounter: counter } });
+    if (claimed.count !== 1) return false;
+    // Migration douce : un secret hérité stocké en clair est rechiffré dès son premier usage réussi.
+    if (user.totpSecret && !isSealed(user.totpSecret) && totpKey())
+        await client.user.update({ where: { id: user.id }, data: { totpSecret: sealSecret(secret) } });
+    return true;
+}
+async function consumeRecoveryCode(userId, code) {
+    const used = await db.totpRecoveryCode.updateMany({ where: { userId, codeHash: recoveryHash(code), usedAt: null }, data: { usedAt: new Date() } });
+    return used.count === 1;
+}
+async function replaceRecoveryCodes(tx, userId) {
+    const codes = newRecoveryCodes();
+    await tx.totpRecoveryCode.deleteMany({ where: { userId } });
+    await tx.totpRecoveryCode.createMany({ data: codes.map(c => ({ userId, codeHash: recoveryHash(c) })) });
+    return codes;
+}
+async function verifyPassword(user, password, message = 'Mot de passe incorrect.') {
+    if (!await argon2.verify(user.passwordHash, password))
+        throw new HttpError(400, message);
 }
 export async function auth(app) {
     // Constant-cost verification for unknown accounts too.
@@ -46,6 +90,10 @@ export async function auth(app) {
             if (!self && !path.startsWith('/api/portal'))
                 throw new HttpError(403, 'Accès réservé à l’administrateur.');
         }
+        // Double authentification obligatoire pour les administrateurs : tant qu'elle n'est pas activée,
+        // la session ne donne accès qu'à l'enrôlement (aucune donnée métier).
+        else if (!req.user.totpEnabled && !ENROLLMENT_PATHS.has(path))
+            throw new HttpError(403, 'Activez la double authentification pour accéder au studio.', 'TOTP_ENROLLMENT_REQUIRED');
         if (!['GET', 'HEAD', 'OPTIONS'].includes(req.method)) {
             checkOrigin(req);
             const provided = req.headers['x-csrf-token'];
@@ -66,17 +114,23 @@ export async function auth(app) {
         if (!user || !valid)
             throw new HttpError(401, 'Email ou mot de passe incorrect.');
         if (user.totpEnabled) {
-            if (!body.token)
-                return { twoFactor: true };
-            if (!verifyTotp(user.totpSecret, body.token))
-                return { twoFactor: true, error: 'Code de vérification incorrect.' };
+            if (body.recoveryCode) {
+                if (!await consumeRecoveryCode(user.id, body.recoveryCode))
+                    return { twoFactor: true, error: 'Code de secours incorrect ou déjà utilisé.' };
+            }
+            else {
+                if (!body.token)
+                    return { twoFactor: true };
+                if (!await consumeTotp(user, body.token))
+                    return { twoFactor: true, error: 'Code de vérification incorrect ou déjà utilisé.' };
+            }
         }
         loginWindows.delete(key);
         const token = randomBytes(32).toString('hex'), csrf = randomBytes(32).toString('hex');
         await db.session.deleteMany({ where: { expiresAt: { lt: new Date() } } });
         await db.session.create({ data: { id: hash(token), csrf, userId: user.id, expiresAt: new Date(Date.now() + 12 * 3600 * 1000) } });
         reply.setCookie(cookieName, token, cookieOptions);
-        return { user: { id: user.id, name: user.name, email: user.email, totpEnabled: user.totpEnabled, role: user.role }, csrf };
+        return { user: { id: user.id, name: user.name, email: user.email, totpEnabled: user.totpEnabled, role: user.role }, csrf, ...(user.role === 'admin' && !user.totpEnabled ? { enrollmentRequired: true } : {}) };
     });
     app.get('/api/auth/me', async (req) => ({ user: req.user, csrf: (await db.session.findUniqueOrThrow({ where: { id: req.sessionId } })).csrf }));
     app.post('/api/auth/logout', async (req, reply) => { await db.session.deleteMany({ where: { id: req.sessionId } }); reply.clearCookie(cookieName, { path: '/', secure: prod }); return { ok: true }; });
@@ -86,43 +140,76 @@ export async function auth(app) {
         const u = await db.user.update({ where: { id: req.user.id }, data: { name } });
         return { ok: true, name: u.name };
     });
-    app.post('/api/auth/email', async (req) => {
-        const b = emailChangeSchema.parse(req.body);
+    // Changement d'email : mot de passe + code 2FA si activée, quota par utilisateur, journalisation,
+    // révocation des autres sessions. (La preuve de possession de la nouvelle adresse exige un service
+    // d'envoi d'emails, absent de l'application : voir docs/CORRECTIONS-PREPRODUCTION.md.)
+    app.post('/api/auth/email', { config: perUserLimit }, async (req) => {
+        const b = emailChangeSchema.extend({ token: totpToken.optional() }).parse(req.body);
         const user = await db.user.findUniqueOrThrow({ where: { id: req.user.id } });
-        if (!await argon2.verify(user.passwordHash, b.password))
-            throw new HttpError(400, 'Mot de passe incorrect.');
-        if (b.email !== user.email && await db.user.findUnique({ where: { email: b.email } }))
+        await verifyPassword(user, b.password);
+        if (user.totpEnabled && (!b.token || !await consumeTotp(user, b.token)))
+            throw new HttpError(400, 'Code de vérification incorrect ou déjà utilisé.');
+        if (b.email === user.email)
+            return { ok: true, email: user.email };
+        if (await db.user.findUnique({ where: { email: b.email } }))
             throw new HttpError(409, 'Cet email est déjà utilisé par un autre compte.');
-        const u = await db.user.update({ where: { id: user.id }, data: { email: b.email } });
+        const u = await db.$transaction(async (tx) => {
+            const updated = await tx.user.update({ where: { id: user.id }, data: { email: b.email } });
+            await tx.session.deleteMany({ where: { userId: user.id, id: { not: req.sessionId } } });
+            await tx.activityLog.create({ data: { userId: user.id, action: 'Email de connexion modifié', entity: 'users', entityId: user.id } });
+            return updated;
+        });
         return { ok: true, email: u.email };
     });
     // Second facteur (TOTP) : l'inscription ne l'active qu'après vérification d'un premier code.
-    app.post('/api/auth/2fa/setup', async (req) => {
+    // Ré-authentification (mot de passe) exigée : une session volée ne peut pas réinitialiser le secret.
+    app.post('/api/auth/2fa/setup', { config: perUserLimit }, async (req) => {
+        const { password } = z.object({ password: z.string().min(1).max(256) }).parse(req.body ?? {});
         const user = await db.user.findUniqueOrThrow({ where: { id: req.user.id } });
         if (user.totpEnabled)
             throw new HttpError(409, 'La double authentification est déjà active.');
+        await verifyPassword(user, password);
         const secret = generateSecret();
-        await db.user.update({ where: { id: user.id }, data: { totpSecret: secret } });
+        await db.user.update({ where: { id: user.id }, data: { totpSecret: sealSecret(secret), totpLastCounter: null } });
         return { secret, otpauth: otpauthURL(secret, user.email) };
     });
-    app.post('/api/auth/2fa/enable', async (req) => {
-        const { token } = z.object({ token: z.string().regex(/^\d{6}$/, 'Code à 6 chiffres attendu.') }).parse(req.body);
+    app.post('/api/auth/2fa/enable', { config: perUserLimit }, async (req) => {
+        const { token } = z.object({ token: totpToken }).parse(req.body);
         const user = await db.user.findUniqueOrThrow({ where: { id: req.user.id } });
         if (user.totpEnabled)
             throw new HttpError(409, 'La double authentification est déjà active.');
-        if (!user.totpSecret || !verifyTotp(user.totpSecret, token))
+        if (!user.totpSecret || !await consumeTotp(user, token))
             throw new HttpError(400, 'Code incorrect. Vérifiez l’heure de votre téléphone et réessayez.');
-        await db.user.update({ where: { id: user.id }, data: { totpEnabled: true } });
-        return { ok: true };
+        const recoveryCodes = await db.$transaction(async (tx) => {
+            await tx.user.update({ where: { id: user.id }, data: { totpEnabled: true } });
+            await tx.session.deleteMany({ where: { userId: user.id, id: { not: req.sessionId } } });
+            await tx.activityLog.create({ data: { userId: user.id, action: 'Double authentification activée', entity: 'users', entityId: user.id } });
+            return replaceRecoveryCodes(tx, user.id);
+        });
+        return { ok: true, recoveryCodes };
     });
-    app.post('/api/auth/2fa/disable', async (req) => {
-        const b = z.object({ password: z.string().max(256), token: z.string().regex(/^\d{6}$/) }).parse(req.body);
+    // Régénère les codes de secours (les anciens sont invalidés). Mot de passe + code TOTP exigés.
+    app.post('/api/auth/2fa/recovery-codes', { config: perUserLimit }, async (req) => {
+        const b = z.object({ password: z.string().max(256), token: totpToken }).parse(req.body);
         const user = await db.user.findUniqueOrThrow({ where: { id: req.user.id } });
-        if (!await argon2.verify(user.passwordHash, b.password))
-            throw new HttpError(400, 'Mot de passe incorrect.');
-        if (!user.totpEnabled || !verifyTotp(user.totpSecret, b.token))
+        await verifyPassword(user, b.password);
+        if (!user.totpEnabled || !await consumeTotp(user, b.token))
+            throw new HttpError(400, 'Code de vérification incorrect ou déjà utilisé.');
+        const recoveryCodes = await db.$transaction(tx => replaceRecoveryCodes(tx, user.id));
+        return { ok: true, recoveryCodes };
+    });
+    app.post('/api/auth/2fa/disable', { config: perUserLimit }, async (req) => {
+        const b = z.object({ password: z.string().max(256), token: totpToken }).parse(req.body);
+        const user = await db.user.findUniqueOrThrow({ where: { id: req.user.id } });
+        await verifyPassword(user, b.password);
+        if (!user.totpEnabled || !await consumeTotp(user, b.token))
             throw new HttpError(400, 'Code de vérification incorrect.');
-        await db.user.update({ where: { id: user.id }, data: { totpEnabled: false, totpSecret: '' } });
+        await db.$transaction([
+            db.user.update({ where: { id: user.id }, data: { totpEnabled: false, totpSecret: '', totpLastCounter: null } }),
+            db.totpRecoveryCode.deleteMany({ where: { userId: user.id } }),
+            db.session.deleteMany({ where: { userId: user.id, id: { not: req.sessionId } } }),
+            db.activityLog.create({ data: { userId: user.id, action: 'Double authentification désactivée', entity: 'users', entityId: user.id } }),
+        ]);
         return { ok: true };
     });
     app.post('/api/auth/password', {config:{rateLimit:{max:5,timeWindow:'15 minutes'}}}, async (req, reply) => {

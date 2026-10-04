@@ -13,13 +13,26 @@ model User {
   createdAt DateTime @default(now())
   totpSecret String @default("")
   totpEnabled Boolean @default(false)
+  // Dernier pas TOTP accepté (anti-rejeu) : tout code d'un pas <= à celui-ci est refusé.
+  totpLastCounter Int?
   role String @default("admin")
   referrerId String?
   referrer Referrer? @relation(fields: [referrerId], references: [id], onDelete: SetNull)
   sessions Session[]
   activities ActivityLog[]
   notifications Notification[]
+  recoveryCodes TotpRecoveryCode[]
   @@index([referrerId])
+}
+// Codes de secours 2FA : stockés hachés (SHA-256 d'un secret aléatoire), utilisables une seule fois.
+model TotpRecoveryCode {
+  id String @id @default(cuid())
+  userId String
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  codeHash String @unique
+  usedAt DateTime?
+  createdAt DateTime @default(now())
+  @@index([userId])
 }
 model Session {
   id String @id
@@ -171,6 +184,10 @@ model Invoice {
   abbyQuoteKey String? @unique
   abbyPdfFetchedAt DateTime?
   lastSyncedAt DateTime?
+  // État durable de la création Abby : creating → draft_created → lines_set → complete.
+  abbySyncState String?
+  // Verrou applicatif (claim atomique) empêchant deux créations/rapprochements Abby simultanés.
+  abbySyncLockedUntil DateTime?
   items InvoiceItem[]
   payments Payment[]
   commissions Commission[]
@@ -323,6 +340,8 @@ model CalendarEntry {
   externalId String? @unique
   attendeeName String?
   attendeeEmail String?
+  // Horodatage (createdAt Cal.com) du dernier événement webhook appliqué : ordre monotone anti-rejeu.
+  lastEventAt DateTime?
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
   @@index([date, source])

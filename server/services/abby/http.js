@@ -16,11 +16,12 @@ export class AbbyError extends Error {
 const DEFAULT_BASE = 'https://api.app-abby.com';
 const RETRYABLE = new Set([429, 500, 502, 503, 504]);
 
-// Tronque un corps d'erreur pour les logs/activité sans jamais exposer le secret.
+import { redact } from '../../redact.js';
+
+// Tronque ET masque un corps d'erreur fournisseur (emails, IBAN, téléphones, jetons…) avant tout log/stockage.
 function safeBody(value) {
     if (value == null) return undefined;
-    const text = typeof value === 'string' ? value : JSON.stringify(value);
-    return text.length > 500 ? text.slice(0, 500) + '…' : text;
+    return redact(value, 500);
 }
 
 export function createAbbyHttp({
@@ -93,8 +94,9 @@ async function parse(res) {
 }
 function messageFrom(payload) {
     if (!payload) return null;
-    if (typeof payload === 'string') return payload.slice(0, 300);
-    return payload.message || payload.error || (Array.isArray(payload.errors) ? payload.errors.join(' · ') : null);
+    const raw = typeof payload === 'string' ? payload : payload.message || payload.error || (Array.isArray(payload.errors) ? payload.errors.join(' · ') : null);
+    // Le message fournisseur est affiché à l'administrateur et journalisé : on le masque et le borne.
+    return raw ? redact(String(raw), 300) : null;
 }
 function httpMessage(status) {
     return {

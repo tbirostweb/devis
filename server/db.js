@@ -24,9 +24,12 @@ export function today() { return new Intl.DateTimeFormat('sv-SE', { timeZone: 'E
 export function addDays(date, days) { const d = new Date(date + 'T12:00:00Z'); d.setUTCDate(d.getUTCDate() + days); return d.toISOString().slice(0, 10); }
 export class HttpError extends Error {
     statusCode;
-    constructor(statusCode, message) {
+    publicCode;
+    constructor(statusCode, message, publicCode) {
         super(message);
         this.statusCode = statusCode;
+        // Code stable exposé au front (ex. TOTP_ENROLLMENT_REQUIRED) ; jamais de détail interne.
+        if (publicCode) this.publicCode = publicCode;
     }
 }
 export function found(item) { if (!item)

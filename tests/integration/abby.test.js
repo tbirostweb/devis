@@ -4,6 +4,7 @@ import assert from 'node:assert/strict';
 import { spawn, execFileSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { today, addDays } from '../../server/db.js';
+import { enrollTotp, nextTotp, testTotpKey } from './totp-helper.js';
 
 // Base jetable OBLIGATOIRE : on refuse tout ce qui n'est pas explicitement la base de test.
 // Jamais la vraie DATABASE_URL. La couche Abby est MOCKÉE (ABBY_MOCK=1) : aucun appel réseau,
@@ -12,10 +13,10 @@ const testUrl = new URL(process.env.TEST_DATABASE_URL || 'mysql://invalid/none')
 if (testUrl.pathname !== '/birostweb_test' || process.env.NODE_ENV === 'production')
     throw new Error('Abby e2e exige TEST_DATABASE_URL sur une base dédiée « birostweb_test », hors production.');
 
-const env = { ...process.env, NODE_ENV: 'test', DATABASE_URL: testUrl.toString(), SEED_DEMO: 'false', STORAGE_PATH: './tmp/test-storage', PORT: '3203', APP_ORIGIN: 'http://127.0.0.1:3203', ADMIN_EMAIL: 'abby-admin@birostweb.example', ADMIN_PASSWORD: randomUUID() + randomUUID(), ABBY_MOCK: '1', ABBY_API_KEY: 'suk-test-mock', ABBY_ENABLED: 'true' };
+const env = { ...process.env, NODE_ENV: 'test', DATABASE_URL: testUrl.toString(), SEED_DEMO: 'false', STORAGE_PATH: './tmp/test-storage', PORT: '3203', APP_ORIGIN: 'http://127.0.0.1:3203', ADMIN_EMAIL: 'abby-admin@birostweb.example', ADMIN_PASSWORD: randomUUID() + randomUUID(), ABBY_MOCK: '1', ABBY_API_KEY: 'suk-test-mock', ABBY_ENABLED: 'true', TOTP_ENCRYPTION_KEY: testTotpKey() };
 delete env.ABBY_ALLOW_LIVE_FINALIZE; // on ne finalise qu'en mock, jamais en live
 const base = 'http://127.0.0.1:3203/api', origin = env.APP_ORIGIN;
-let child, logs = '', cookie = '', csrf = '', client, quoteA, quoteB, abbyInvoice;
+let child, logs = '', cookie = '', csrf = '', adminTotp, client, quoteA, quoteB, abbyInvoice;
 const now = today();
 
 async function call(path, { method = 'GET', body, headers = {}, anonymous = false } = {}) {
@@ -24,7 +25,7 @@ async function call(path, { method = 'GET', body, headers = {}, anonymous = fals
     return { status: response.status, data: json ? await response.json() : Buffer.from(await response.arrayBuffer()), headers: response.headers };
 }
 async function ok(path, opts) { const r = await call(path, opts); assert.equal(r.status, 200, `${path}: ${JSON.stringify(r.data)}`); return r.data; }
-async function login(email, password) { const r = await call('/auth/login', { method: 'POST', anonymous: true, body: { email, password } }); assert.equal(r.status, 200, JSON.stringify(r.data)); cookie = r.headers.get('set-cookie').split(';')[0]; csrf = r.data.csrf; }
+async function login(email, password, totpSecret) { const r = await call('/auth/login', { method: 'POST', anonymous: true, body: { email, password, ...(totpSecret ? { token: await nextTotp(totpSecret) } : {}) } }); assert.equal(r.status, 200, JSON.stringify(r.data)); cookie = r.headers.get('set-cookie').split(';')[0]; csrf = r.data.csrf; }
 const line = (unitCents, extra = {}) => ({ name: 'Prestation QA', description: 'desc', category: 'Création', section: 'Projet', unitCents, quantityMilli: 1000, frequency: 'once', vatBps: 0, discountBps: 0, optional: false, selected: true, position: 0, ...extra });
 const quoteBody = (extra = {}) => ({ clientId: client.id, title: 'QA Abby', issuedDate: now, validUntil: addDays(now, 30), depositBps: 3000, discountBps: 0, conditions: 'Acompte 30%.', legalNotice: 'TVA non applicable, art. 293 B du CGI', items: [line(99900), line(4500, { frequency: 'monthly', name: 'Hébergement' })], ...extra });
 
@@ -46,6 +47,7 @@ before(async () => {
     for (let i = 0; i < 60; i++) { try { if ((await fetch(base + '/health')).ok) { ready = true; break; } } catch {} await new Promise(r => setTimeout(r, 150)); }
     if (!ready) throw new Error(logs.slice(-3000));
     await login(env.ADMIN_EMAIL, env.ADMIN_PASSWORD);
+    adminTotp = (await enrollTotp(call, env.ADMIN_PASSWORD)).secret; // 2FA administrateur obligatoire
     // Paramètres : franchise en base, TVA non applicable (lecture depuis Settings, pas de hardcode).
     const s = await ok('/settings'); await ok('/settings', { method: 'PUT', body: { ...s, address: '1 rue QA, 75001 Paris', siret: '00000000000000', vatEnabled: false } });
     client = await ok('/clients', { method: 'POST', body: { name: 'QA Abby Client', email: 'qa@abby.example', address: '1 rue QA', status: 'active' } });
@@ -129,5 +131,5 @@ test('Abby billing is ADMIN only: a referrer account is refused (403)', async ()
     await login('refuser@abby.example', pwd);
     assert.equal((await call('/quotes/' + quoteA.id + '/abby-invoice', { method: 'POST', body: {} })).status, 403);
     assert.equal((await call('/invoices/' + abbyInvoice.id + '/abby/finalize', { method: 'POST', body: {} })).status, 403);
-    await login(env.ADMIN_EMAIL, env.ADMIN_PASSWORD); // restaure la session admin
+    await login(env.ADMIN_EMAIL, env.ADMIN_PASSWORD, adminTotp); // restaure la session admin
 });

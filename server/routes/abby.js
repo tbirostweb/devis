@@ -6,6 +6,7 @@ import { company } from './records.js';
 import { quoteStatus } from './commercial.js';
 import { abbyPaymentSchema } from '../../shared/contracts.js';
 import { totals } from '../../shared/money.js';
+import { redact } from '../redact.js';
 import { getAbbyService, buildAbbyLines, vatMentionFor, readInvoiceSync, assertFinalizable, abbyEnabled, AbbyError } from '../services/abby/index.js';
 
 const params = z.object({ id: z.string().min(1) });
@@ -25,19 +26,45 @@ function requireEnabled() {
         throw new HttpError(503, 'Intégration Abby désactivée. Renseignez ABBY_API_KEY et ABBY_ENABLED.');
 }
 
-// Enregistre une erreur de synchro dans l'historique (message seulement, pas de secret).
+// Enregistre une erreur de synchro dans l'historique (message masqué : ni secret ni donnée personnelle).
 async function logError(userId, action, invoiceId, clientId, message) {
-    try { await audit(db, userId, `${action} · échec : ${String(message).slice(0, 180)}`, 'invoices', invoiceId, { invoiceId, clientId }); }
+    try { await audit(db, userId, `${action} · échec : ${redact(String(message), 180)}`, 'invoices', invoiceId, { invoiceId, clientId }); }
     catch { /* journalisation best-effort */ }
 }
 
+// --- Verrou applicatif par facture (claim atomique) ---
+// Un UPDATE conditionnel ne réussit que pour une seule requête : les autres attendent ou reçoivent 409.
+// Le verrou expire (LOCK_MS) pour qu'un crash ne bloque pas définitivement la facture.
+const LOCK_MS = 2 * 60 * 1000;
+const isComplete = (inv) => !!inv.abbyInvoiceId && (inv.abbySyncState ?? 'complete') === 'complete'; // null = ligne héritée créée avant le suivi d'état
+export async function claimAbbyLock(id) {
+    const now = new Date();
+    const r = await db.invoice.updateMany({ where: { id, OR: [{ abbySyncLockedUntil: null }, { abbySyncLockedUntil: { lt: now } }] }, data: { abbySyncLockedUntil: new Date(now.getTime() + LOCK_MS) } });
+    return r.count === 1;
+}
+async function releaseAbbyLock(id) {
+    try { await db.invoice.updateMany({ where: { id }, data: { abbySyncLockedUntil: null } }); } catch { /* expirera seul */ }
+}
+async function withAbbyLock(id, work) {
+    if (!await claimAbbyLock(id))
+        throw new HttpError(409, 'Une opération Abby est déjà en cours pour cette facture. Réessayez dans quelques instants.', 'ABBY_SYNC_IN_PROGRESS');
+    try { return await work(); }
+    finally { await releaseAbbyLock(id); }
+}
+const fullInvoice = (id) => db.invoice.findUnique({ where: { id }, include: { client: true, items: true } }).then(found);
+
 export async function abby(app, deps = {}) {
     const service = () => getAbbyService(deps.service);
+    const waitMs = deps.lockWaitMs ?? 15000;
 
     // Crée (ou retrouve) la facture Abby pour un devis ACCEPTÉ. Idempotent : jamais deux factures pour un même devis.
+    // Machine à états durable : creating → draft_created → lines_set → complete. Une reprise après échec repart
+    // de l'étape incomplète, sans recréer de brouillon. Une création interrompue AVANT l'enregistrement de l'id
+    // Abby (état « creating ») exige une confirmation explicite après vérification manuelle dans Abby.
     app.post('/api/quotes/:id/abby-invoice', async (req) => {
         requireEnabled();
         const { id } = params.parse(req.params);
+        const { confirmNoDuplicate } = z.object({ confirmNoDuplicate: z.boolean().optional() }).parse(req.body ?? {});
         // 1) Verrou d'idempotence côté base : une seule Invoice par abbyQuoteKey (=quoteId).
         let local, quote;
         try {
@@ -73,33 +100,63 @@ export async function abby(app, deps = {}) {
             }
             else throw e;
         }
-        // 2) Déjà créée chez Abby → idempotent, on renvoie tel quel.
-        if (local.abbyInvoiceId)
-            return found(await db.invoice.findUnique({ where: { id: local.id }, include: { client: true, items: true } }));
-        // 3) Création côté Abby (hors transaction DB : appel réseau).
-        const settings = await company();
+        // 2) Déjà créée et complète chez Abby → idempotent, on renvoie tel quel.
+        if (isComplete(local))
+            return fullInvoice(local.id);
+        // 3) Claim atomique : une seule requête pilote la création. Les autres (double-clic) attendent la fin
+        //    puis renvoient le résultat, sans jamais appeler Abby une seconde fois.
+        if (!await claimAbbyLock(local.id)) {
+            for (const until = Date.now() + waitMs; Date.now() < until;) {
+                await new Promise(r => setTimeout(r, 200));
+                const current = await db.invoice.findUnique({ where: { id: local.id } });
+                if (current && isComplete(current) && !current.abbySyncLockedUntil) return fullInvoice(local.id);
+                if (current && !current.abbySyncLockedUntil) break;
+            }
+            throw new HttpError(409, 'La création de la facture Abby est déjà en cours ou doit être reprise. Réessayez dans quelques instants.', 'ABBY_SYNC_IN_PROGRESS');
+        }
         try {
+            let inv = found(await db.invoice.findUnique({ where: { id: local.id } })); // relu sous verrou
+            if (isComplete(inv)) return fullInvoice(inv.id);
+            const settings = await company();
             const svc = service();
-            const client = quote.client;
-            const org = await svc.ensureOrganization(client);
-            if (org.created || !client.abbyClientId)
-                await db.client.update({ where: { id: client.id }, data: { abbyClientId: org.id } });
-            const draft = await svc.createDraftInvoice(org.id);
-            const sync = readInvoiceSync(draft);
-            // On mémorise l'id Abby AVANT d'éditer les lignes : pas d'orphelin en cas d'échec ultérieur.
-            await db.invoice.update({ where: { id: local.id }, data: { ...sync, lastSyncedAt: new Date() } });
-            const lines = buildAbbyLines(quote.items.filter(i => !i.optional || i.selected), { discountBps: quote.discountBps, vatEnabled: settings.vatEnabled });
-            await svc.setInvoiceLines(sync.abbyInvoiceId, lines, quote.discountBps > 0 ? { mode: 'PERCENTAGE', amount: quote.discountBps } : undefined);
-            const mention = vatMentionFor(settings);
-            if (mention)
-                await svc.setGeneralInfo(sync.abbyInvoiceId, { vatMention: mention, footerNote: settings.vatExemptionText });
-            await audit(db, req.user.id, `Facture Abby créée · brouillon ${sync.abbyInvoiceId}`, 'invoices', local.id, { clientId: client.id, invoiceId: local.id, quoteId: quote.id });
+            if (!inv.abbyInvoiceId) {
+                if (inv.abbySyncState === 'creating' && !confirmNoDuplicate)
+                    throw new HttpError(409, 'Une création précédente a été interrompue : un brouillon a pu être créé chez Abby. Vérifiez les brouillons de ce client dans Abby (supprimez un éventuel doublon), puis relancez en confirmant.', 'ABBY_RECONCILE_REQUIRED');
+                let client = found(await db.client.findUnique({ where: { id: quote.clientId } }));
+                const org = await svc.ensureOrganization(client);
+                if (!client.abbyClientId) {
+                    // Rattachement conditionnel : si une autre facture a lié le client entre-temps, on garde ce lien.
+                    const linked = await db.client.updateMany({ where: { id: client.id, abbyClientId: null }, data: { abbyClientId: org.id } });
+                    if (linked.count !== 1) client = found(await db.client.findUnique({ where: { id: client.id } }));
+                    else client = { ...client, abbyClientId: org.id };
+                }
+                // État durable AVANT l'appel réseau : une interruption ensuite est détectée au prochain essai.
+                await db.invoice.update({ where: { id: inv.id }, data: { abbySyncState: 'creating' } });
+                const draft = await svc.createDraftInvoice(client.abbyClientId);
+                const sync = readInvoiceSync(draft ?? {});
+                if (!sync.abbyInvoiceId) throw new AbbyError(0, 'Abby n’a pas renvoyé d’identifiant de facture.');
+                // On mémorise l'id Abby AVANT d'éditer les lignes : pas d'orphelin en cas d'échec ultérieur.
+                inv = await db.invoice.update({ where: { id: inv.id }, data: { ...sync, abbySyncState: 'draft_created', lastSyncedAt: new Date() } });
+            }
+            if (inv.abbySyncState === 'draft_created') {
+                const lines = buildAbbyLines(quote.items.filter(i => !i.optional || i.selected), { discountBps: quote.discountBps, vatEnabled: settings.vatEnabled });
+                await svc.setInvoiceLines(inv.abbyInvoiceId, lines, quote.discountBps > 0 ? { mode: 'PERCENTAGE', amount: quote.discountBps } : undefined);
+                inv = await db.invoice.update({ where: { id: inv.id }, data: { abbySyncState: 'lines_set' } });
+            }
+            if (inv.abbySyncState === 'lines_set') {
+                const mention = vatMentionFor(settings);
+                if (mention)
+                    await svc.setGeneralInfo(inv.abbyInvoiceId, { vatMention: mention, footerNote: settings.vatExemptionText });
+                inv = await db.invoice.update({ where: { id: inv.id }, data: { abbySyncState: 'complete' } });
+                await audit(db, req.user.id, `Facture Abby créée · brouillon ${inv.abbyInvoiceId}`, 'invoices', inv.id, { clientId: quote.clientId, invoiceId: inv.id, quoteId: quote.id });
+            }
         }
         catch (e) {
-            await logError(req.user.id, 'Création facture Abby', local.id, quote.clientId, (e instanceof AbbyError ? e.message : 'erreur interne'));
+            await logError(req.user.id, 'Création facture Abby', local.id, quote.clientId, (e instanceof AbbyError ? e.message : e instanceof HttpError ? e.message : 'erreur interne'));
             throw toHttp(e);
         }
-        return found(await db.invoice.findUnique({ where: { id: local.id }, include: { client: true, items: true } }));
+        finally { await releaseAbbyLock(local.id); }
+        return fullInvoice(local.id);
     });
 
     // Finalise la facture Abby : numéro officiel irréversible. Filet de sécurité test/live.
@@ -109,18 +166,24 @@ export async function abby(app, deps = {}) {
         const inv = found(await db.invoice.findUnique({ where: { id }, include: { client: true } }));
         if (!inv.abbyInvoiceId) throw new HttpError(409, 'Cette facture n’existe pas encore chez Abby.');
         if (inv.abbyStatus && inv.abbyStatus !== 'draft') throw new HttpError(409, 'Cette facture Abby est déjà finalisée.');
-        try {
-            assertFinalizable({ test: inv.abbyTest }); // refuse si pas en mode test (sauf ABBY_ALLOW_LIVE_FINALIZE=true)
-            const dto = await service().finalizeInvoice(inv.abbyInvoiceId);
-            const sync = readInvoiceSync(dto);
-            const updated = await db.invoice.update({ where: { id }, data: { ...sync, status: 'sent', lastSyncedAt: new Date() }, include: { client: true } });
-            await audit(db, req.user.id, `Facture Abby finalisée · ${sync.abbyNumber || sync.abbyInvoiceId}`, 'invoices', id, { clientId: inv.clientId, invoiceId: id });
-            return updated;
-        }
-        catch (e) {
-            await logError(req.user.id, 'Finalisation facture Abby', id, inv.clientId, (e instanceof AbbyError ? e.message : 'erreur interne'));
-            throw toHttp(e);
-        }
+        // Jamais de numéro officiel sur un brouillon incomplet (lignes ou mentions non encore envoyées).
+        if (!isComplete(inv)) throw new HttpError(409, 'La création de cette facture chez Abby est incomplète : relancez « Créer la facture Abby » avant de finaliser.', 'ABBY_SYNC_INCOMPLETE');
+        return withAbbyLock(id, async () => {
+            const fresh = found(await db.invoice.findUnique({ where: { id } }));
+            if (fresh.abbyStatus && fresh.abbyStatus !== 'draft') throw new HttpError(409, 'Cette facture Abby est déjà finalisée.');
+            try {
+                assertFinalizable({ test: fresh.abbyTest }); // refuse si pas en mode test (sauf ABBY_ALLOW_LIVE_FINALIZE=true)
+                const dto = await service().finalizeInvoice(fresh.abbyInvoiceId);
+                const sync = readInvoiceSync(dto);
+                const updated = await db.invoice.update({ where: { id }, data: { ...sync, status: 'sent', lastSyncedAt: new Date() }, include: { client: true } });
+                await audit(db, req.user.id, `Facture Abby finalisée · ${sync.abbyNumber || sync.abbyInvoiceId}`, 'invoices', id, { clientId: inv.clientId, invoiceId: id });
+                return updated;
+            }
+            catch (e) {
+                await logError(req.user.id, 'Finalisation facture Abby', id, inv.clientId, (e instanceof AbbyError ? e.message : 'erreur interne'));
+                throw toHttp(e);
+            }
+        });
     });
 
     // Synchronise l'état depuis Abby (lecture idempotente).
@@ -152,7 +215,7 @@ export async function abby(app, deps = {}) {
         try {
             const bytes = await service().downloadInvoicePdf(inv.abbyInvoiceId);
             await db.invoice.update({ where: { id }, data: { abbyPdfFetchedAt: new Date() } });
-            return reply.type('application/pdf').header('Content-Disposition', `inline; filename="${inv.abbyNumber || inv.reference}.pdf"`).send(bytes);
+            return reply.type('application/pdf').header('Content-Disposition', `inline; filename="${String(inv.abbyNumber || inv.reference).replace(/[^\w.-]/g, '_').slice(0, 80)}.pdf"`).send(bytes);
         }
         catch (e) { throw toHttp(e); }
     });
@@ -164,21 +227,30 @@ export async function abby(app, deps = {}) {
         const inv = found(await db.invoice.findUnique({ where: { id }, include: { client: true } }));
         if (!inv.abbyInvoiceId) throw new HttpError(409, 'Cette facture n’existe pas encore chez Abby.');
         const b = z.object({ paid: z.boolean() }).parse(req.body);
-        try {
-            let dto;
-            if (b.paid) {
-                const p = abbyPaymentSchema.parse(req.body);
-                dto = await service().markPaid(inv.abbyInvoiceId, [{ amount: p.amountCents, receivedAt: p.date, method: PAYMENT_METHODS[p.method] }]);
+        const p = b.paid ? abbyPaymentSchema.parse(req.body) : null;
+        // Rapprochement seulement sur une facture finalisée, non déjà payée, pour un montant ≤ total facturé.
+        if (b.paid) {
+            if (!['finalized', 'signed'].includes(inv.abbyStatus)) throw new HttpError(409, inv.abbyStatus === 'paid' ? 'Cette facture Abby est déjà marquée payée.' : 'Finalisez la facture Abby avant d’enregistrer un règlement.');
+            if (p.amountCents > inv.totalCents) throw new HttpError(400, 'Le montant réglé dépasse le total de la facture.');
+        }
+        else if (inv.abbyStatus !== 'paid') throw new HttpError(409, 'Cette facture Abby n’est pas marquée payée.');
+        // Verrou : deux clics simultanés ne produisent jamais deux rapprochements chez Abby.
+        return withAbbyLock(id, async () => {
+            const fresh = found(await db.invoice.findUnique({ where: { id } }));
+            if (fresh.abbyStatus !== inv.abbyStatus) throw new HttpError(409, 'La facture a changé entre-temps. Rechargez la page.');
+            try {
+                const dto = b.paid
+                    ? await service().markPaid(inv.abbyInvoiceId, [{ amount: p.amountCents, receivedAt: p.date, method: PAYMENT_METHODS[p.method] }])
+                    : await service().markUnpaid(inv.abbyInvoiceId);
+                const sync = dto ? readInvoiceSync(dto) : { abbyStatus: b.paid ? 'paid' : 'finalized' };
+                const updated = await db.invoice.update({ where: { id }, data: { ...sync, lastSyncedAt: new Date() }, include: { client: true } });
+                await audit(db, req.user.id, `Facture Abby ${b.paid ? 'marquée payée' : 'marquée impayée'}`, 'invoices', id, { clientId: inv.clientId, invoiceId: id });
+                return updated;
             }
-            else dto = await service().markUnpaid(inv.abbyInvoiceId);
-            const sync = dto ? readInvoiceSync(dto) : { abbyStatus: b.paid ? 'paid' : 'finalized' };
-            const updated = await db.invoice.update({ where: { id }, data: { ...sync, lastSyncedAt: new Date() }, include: { client: true } });
-            await audit(db, req.user.id, `Facture Abby ${b.paid ? 'marquée payée' : 'marquée impayée'}`, 'invoices', id, { clientId: inv.clientId, invoiceId: id });
-            return updated;
-        }
-        catch (e) {
-            await logError(req.user.id, 'Paiement facture Abby', id, inv.clientId, (e instanceof AbbyError ? e.message : 'erreur interne'));
-            throw toHttp(e);
-        }
+            catch (e) {
+                await logError(req.user.id, 'Paiement facture Abby', id, inv.clientId, (e instanceof AbbyError ? e.message : 'erreur interne'));
+                throw toHttp(e);
+            }
+        });
     });
 }
