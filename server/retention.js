@@ -7,7 +7,9 @@ export async function purgeTechnicalData(db, now = new Date()) {
         activity: (await tx.activityLog.deleteMany({where:{createdAt:{lt:cutoff}, clientId:null, quoteId:null, projectId:null, invoiceId:null}})).count,
     }));
 }
-export function scheduleRetention(db, logger) {
+export function scheduleRetention(db, logger, enabled = process.env.RETENTION_ENABLED) {
+    // A deployment must not silently authorize deletion of existing records.
+    if (enabled !== 'true') return () => {};
     let running = false;
     const run = async () => { if(running)return; running=true; try {await purgeTechnicalData(db);} catch {logger.error('Purge technique échouée');} finally {running=false;} };
     const timer=setInterval(run, 86400000); timer.unref(); run(); return () => clearInterval(timer);
