@@ -14,7 +14,46 @@ const totpToken = z.string().regex(/^\d{6}$/, 'Code à 6 chiffres attendu.');
 // Code de secours : 10 caractères base32 (affichés XXXXX-XXXXX), ~50 bits d'entropie, usage unique.
 const recoveryCode = z.string().trim().max(32).transform(s => s.toUpperCase().replace(/[^A-Z2-7]/g, '')).pipe(z.string().length(10, 'Code de secours invalide.'));
 const loginSchema = z.object({ email: z.email().transform(s => s.toLowerCase()), password: z.string().min(1).max(256), token: totpToken.optional(), recoveryCode: recoveryCode.optional() });
-const loginWindows = new Map();
+// Échecs de connexion : seuls les échecs sont comptés, par couple (email + IP), avec un délai progressif
+// (et non un blocage dur) ; un plafond distinct par email, plus élevé, freine les attaques distribuées
+// sans permettre à un tiers de bloquer durablement le compte depuis une autre adresse.
+const loginFailures = new Map();
+const LOGIN_FREE_FAILURES = 5, LOGIN_EMAIL_FREE_FAILURES = 50, LOGIN_MAX_DELAY_MS = 15 * 60 * 1000, LOGIN_EMAIL_MAX_DELAY_MS = 60 * 1000, LOGIN_WINDOW_MS = 15 * 60 * 1000, LOGIN_MAX_ENTRIES = 10000;
+function loginKeys(email, ip) { return { pair: 'p:' + hash(email + '|' + (ip || '')), email: 'e:' + hash(email) }; }
+function loginDelay(entry, free, max) { return entry.count < free ? 0 : Math.min(max, 1000 * 2 ** Math.min(20, entry.count - free)); }
+function checkLoginDelay(keys, now = Date.now()) {
+    for (const [k, v] of loginFailures) if (v.last + LOGIN_WINDOW_MS < now) loginFailures.delete(k); else break;
+    const pair = loginFailures.get(keys.pair), byEmail = loginFailures.get(keys.email);
+    const until = Math.max(pair ? pair.last + loginDelay(pair, LOGIN_FREE_FAILURES, LOGIN_MAX_DELAY_MS) : 0, byEmail ? byEmail.last + loginDelay(byEmail, LOGIN_EMAIL_FREE_FAILURES, LOGIN_EMAIL_MAX_DELAY_MS) : 0);
+    if (until > now)
+        throw new HttpError(429, `Trop de tentatives. Réessayez dans ${Math.ceil((until - now) / 1000)} s.`);
+}
+function recordLoginFailure(keys, now = Date.now()) {
+    for (const key of [keys.pair, keys.email]) {
+        const entry = loginFailures.get(key) ?? { count: 0, last: now };
+        entry.count++; entry.last = now;
+        // Réinsertion en fin de Map : l'ordre reste celui du dernier échec (purge et éviction des plus anciens).
+        loginFailures.delete(key); loginFailures.set(key, entry);
+    }
+    while (loginFailures.size > LOGIN_MAX_ENTRIES) loginFailures.delete(loginFailures.keys().next().value);
+}
+export function resetLoginFailures() { loginFailures.clear(); }
+// Routes accessibles sans session. Webhook Cal.com : authentifié par signature HMAC (voir routes/calendar.js), hors session + CSRF.
+const PUBLIC_PATHS = new Set(['/api/health', '/api/webhooks/cal-com']);
+function isPublicPath(path) { return !path.startsWith('/api/') || PUBLIC_PATHS.has(path); }
+// Chemin de la route trouvée par le routeur (motif, ex. /api/clients/:id). Sans route (404),
+// on retombe sur le chemin décodé pour rester fail-closed sur /api.
+function routePath(req) {
+    const url = req.routeOptions?.url;
+    if (url) return url;
+    const raw = req.url.split('?')[0];
+    try { return decodeURIComponent(raw); } catch { return raw; }
+}
+export function hasEncodedUnreserved(path) {
+    for (const m of path.matchAll(/%([0-9a-fA-F]{2})/g))
+        if (/[A-Za-z0-9\-._~]/.test(String.fromCharCode(parseInt(m[1], 16)))) return true;
+    return false;
+}
 // Quota par utilisateur (et non par IP) pour les opérations sensibles du compte : évalué après l'authentification.
 export const perUserLimit = { rateLimit: { max: 5, timeWindow: '15 minutes', hook: 'preHandler', keyGenerator: (req) => 'user:' + (req.user?.id ?? req.ip) } };
 // Chemins accessibles à un administrateur qui n'a pas encore activé la double authentification.
@@ -68,9 +107,14 @@ export async function auth(app) {
     app.decorateRequest('user', null);
     app.decorateRequest('sessionId', '');
     app.addHook('onRequest', async (req) => {
-        const path = req.url.split('?')[0];
-        // Webhook Cal.com : authentifié par signature HMAC (voir routes/calendar.js), hors session + CSRF.
-        if (!path.startsWith('/api/') || path === '/api/health' || path === '/api/webhooks/cal-com')
+        const rawPath = req.url.split('?')[0];
+        // Un caractère non réservé n'a jamais besoin d'être encodé : sa présence signale une tentative
+        // de contournement (ex. /%61pi/... décodé en /api/... par le routeur).
+        if (hasEncodedUnreserved(rawPath))
+            throw new HttpError(400, 'Chemin de requête invalide.');
+        // Décision prise sur la route effectivement trouvée par le routeur (et non sur l'URL brute).
+        const path = routePath(req);
+        if (isPublicPath(path))
             return;
         if (path === '/api/auth/login') {
             checkOrigin(req);
@@ -101,31 +145,39 @@ export async function auth(app) {
                 throw new HttpError(403, 'Jeton de sécurité invalide. Rechargez la page.');
         }
     });
+    // Garde-fou fail-closed : aucune route /api non publique n'atteint son handler sans session.
+    app.addHook('preHandler', async (req) => {
+        const path = routePath(req);
+        if (!isPublicPath(path) && path !== '/api/auth/login' && !req.user)
+            throw new HttpError(401, 'Connectez-vous pour accéder au studio.');
+    });
     app.post('/api/auth/login', { config: { rateLimit: { max: 5, timeWindow: '15 minutes' } } }, async (req, reply) => {
         const body = loginSchema.parse(req.body);
-        const now=Date.now(),key=hash(body.email);
-        for(const [k,v] of loginWindows)if(v.until<now)loginWindows.delete(k);
-        const attempt=loginWindows.get(key)||{count:0,until:now+15*60*1000};
-        if(attempt.count>=8)throw new HttpError(429,'Trop de tentatives. Réessayez dans 15 minutes.');
-        if(loginWindows.size>=10000&&!loginWindows.has(key))throw new HttpError(429,'Trop de tentatives. Réessayez plus tard.');
-        attempt.count++;loginWindows.set(key,attempt);
+        const keys = loginKeys(body.email, req.ip);
+        checkLoginDelay(keys);
         const user = await db.user.findUnique({ where: { email: body.email } });
         const valid = await argon2.verify(user?.passwordHash ?? dummyHash, body.password);
-        if (!user || !valid)
+        if (!user || !valid) {
+            recordLoginFailure(keys);
             throw new HttpError(401, 'Email ou mot de passe incorrect.');
+        }
         if (user.totpEnabled) {
             if (body.recoveryCode) {
-                if (!await consumeRecoveryCode(user.id, body.recoveryCode))
+                if (!await consumeRecoveryCode(user.id, body.recoveryCode)) {
+                    recordLoginFailure(keys);
                     return { twoFactor: true, error: 'Code de secours incorrect ou déjà utilisé.' };
+                }
             }
             else {
                 if (!body.token)
                     return { twoFactor: true };
-                if (!await consumeTotp(user, body.token))
+                if (!await consumeTotp(user, body.token)) {
+                    recordLoginFailure(keys);
                     return { twoFactor: true, error: 'Code de vérification incorrect ou déjà utilisé.' };
+                }
             }
         }
-        loginWindows.delete(key);
+        loginFailures.delete(keys.pair);
         const token = randomBytes(32).toString('hex'), csrf = randomBytes(32).toString('hex');
         await db.session.deleteMany({ where: { expiresAt: { lt: new Date() } } });
         await db.session.create({ data: { id: hash(token), csrf, userId: user.id, expiresAt: new Date(Date.now() + 12 * 3600 * 1000) } });

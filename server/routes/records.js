@@ -78,5 +78,6 @@ export async function records(app) {
         if (p.clientId !== data.clientId)
             throw new HttpError(400, 'Le projet appartient à un autre client.');
     } const s = await tx.subscription.create({ data }); await audit(tx, req.user.id, `Abonnement créé · ${s.name}`, 'subscriptions', s.id, { clientId: s.clientId }); return s; }));
-    app.patch('/api/subscriptions/:id', async (req) => transaction(async (tx) => { const b = z.object({ active: z.boolean(), nextDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional() }).parse(req.body); const s = await tx.subscription.update({ where: idParams.parse(req.params), data: { ...b, endDate: b.active ? null : today() } }); await audit(tx, req.user.id, `Abonnement ${b.active ? 'activé' : 'arrêté'} · ${s.name}`, 'subscriptions', s.id, { clientId: s.clientId }); return s; }));
+    app.patch('/api/subscriptions/:id', async (req) => transaction(async (tx) => { const b = z.object({ active: z.boolean(), nextDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional() }).parse(req.body); const where = idParams.parse(req.params); if (b.nextDate !== undefined && b.nextDate < found(await tx.subscription.findUnique({ where })).nextDate)
+        throw new HttpError(400, 'La prochaine échéance ne peut pas être antérieure à l’échéance actuelle.'); const s = await tx.subscription.update({ where, data: { ...b, endDate: b.active ? null : today() } }); await audit(tx, req.user.id, `Abonnement ${b.active ? 'activé' : 'arrêté'} · ${s.name}`, 'subscriptions', s.id, { clientId: s.clientId }); return s; }));
 }

@@ -6,4 +6,6 @@ export const paid=(r)=>r.payments?.reduce((a,p)=>a+p.amountCents,0)||0;
 export const initials=(s='')=>s.split(' ').slice(0,2).map(v=>v[0]).join('').toUpperCase();
 export const progress=(p)=>p.tasks?.length?Math.round(p.tasks.filter(t=>t.done).length/p.tasks.length*100):0;
 export const sizeLabel=n=>n>1048576?`${(n/1048576).toFixed(1)} Mo`:`${Math.max(1,Math.round(n/1024))} Ko`;
-export function downloadCsv(name,headers,rows){const encode=v=>`"${String(v??'').replace(/^[=+@-]/,"'$&").replaceAll('"','""')}"`;const blob=new Blob(['\ufeff'+[headers,...rows].map(row=>row.map(encode).join(';')).join('\r\n')],{type:'text/csv;charset=utf-8'});const url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download=name;a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);}
+// Neutralise les formules CSV (=, +, -, @, espace, tabulation, retour chariot en tête) ; un nombre pur (ex. -12.50) reste intact.
+export const csvSafe=v=>{const s=String(v??'');return /^-?\d+(?:[.,]\d+)?$/.test(s)?s:s.replace(/^[\s=+\-@\t\r]/,"'$&");};
+export function downloadCsv(name,headers,rows){const encode=v=>`"${csvSafe(v).replaceAll('"','""')}"`;const blob=new Blob(['\ufeff'+[headers,...rows].map(row=>row.map(encode).join(';')).join('\r\n')],{type:'text/csv;charset=utf-8'});const url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download=name;a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);}

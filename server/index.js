@@ -14,6 +14,7 @@ import { Prisma } from '@prisma/client';
 import { db } from './db.js';
 import { safeError } from './redact.js';
 import { totpKey } from './secrets.js';
+import { ibanKey } from './iban.js';
 import { parseTrustProxy } from './config.js';
 import { auth } from './auth.js';
 import { records } from './routes/records.js';
@@ -32,9 +33,12 @@ if (prod && process.env.ADMIN_PASSWORD && process.env.INITIALIZE_ADMIN !== 'true
 // Clé de chiffrement des secrets 2FA : obligatoire en production (la 2FA administrateur est imposée).
 if (prod && !totpKey())
     throw new Error('TOTP_ENCRYPTION_KEY (32 octets, base64 ou hex) est obligatoire en production.');
+// Clé de chiffrement des IBAN : également obligatoire en production (échec au démarrage plutôt qu'à l'usage).
+if (prod)
+    ibanKey();
 const trustProxy = parseTrustProxy(process.env.TRUST_PROXY);
 if (prod && trustProxy === true)
-    console.warn('AVERTISSEMENT : TRUST_PROXY=true fait confiance à toute adresse. Indiquez plutôt l’IP/CIDR du proxy Traefik/Dokploy.');
+    throw new Error('TRUST_PROXY=true fait confiance à toute adresse (X-Forwarded-For falsifiable) : indiquez l’IP/CIDR du proxy Traefik/Dokploy ou un nombre de sauts.');
 const app = Fastify({ logger: { level: prod ? 'info' : 'warn', redact: ['req.headers.cookie', 'req.headers.authorization', 'req.headers.x-csrf-token'] }, trustProxy, bodyLimit: 512 * 1024 });
 await app.register(cookie);
 app.addHook('onRoute', options => { if (options.url.startsWith('/api/')) options.compress = false; });
