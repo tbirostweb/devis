@@ -63,7 +63,3 @@ L'envoi email reste manuel : « Marquer envoyé » enregistre une action déclar
 Les indicateurs de trésorerie sont des estimations, distinctes du résultat comptable après cotisations et impôts. Les conditions et mentions doivent être renseignées pour votre activité. Un acompte payé avant l'émission d'une facture peut être affecté ensuite à celle-ci depuis sa fiche, sans enregistrer un second paiement. Les montants non affectés restent visibles dans les encaissements du projet.
 
 Le déploiement et la restauration sont à valider sur le VPS cible ; aucun serveur Dokploy n'a été modifié depuis ce projet. Les fichiers et la base doivent être sauvegardés ensemble. Utiliser une seule réplique applicative avec le stockage actuel et la limitation des tentatives en mémoire.
-
-## Purge technique sur autorisation
-
-La maintenance de rétention est désactivée par défaut : `RETENTION_ENABLED=false` ou variable absente. Un déploiement ne supprime donc pas les anciens enregistrements via ce job. Après sauvegarde restaurable et autorisation explicite de purge, `RETENTION_ENABLED=true` active la purge technique au démarrage puis quotidiennement. Factures, contrats, devis, paiements et justificatifs restent exclus.

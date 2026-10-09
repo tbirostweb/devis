@@ -1,10 +1,6 @@
 import 'dotenv/config';
 import { PrismaClient, Prisma } from '@prisma/client';
-import { protectIbans } from './iban.js';
-export const db = new PrismaClient().$extends({ query: { $allModels: { async $allOperations({args,query}) {
-    for (const field of ['data','create','update']) if (args[field]) args[field] = protectIbans(args[field], true);
-    return protectIbans(await query(args), false);
-} } } });
+export const db = new PrismaClient();
 export async function transaction(work) {
     for (let attempt = 0;; attempt++) {
         try {
@@ -28,12 +24,9 @@ export function today() { return new Intl.DateTimeFormat('sv-SE', { timeZone: 'E
 export function addDays(date, days) { const d = new Date(date + 'T12:00:00Z'); d.setUTCDate(d.getUTCDate() + days); return d.toISOString().slice(0, 10); }
 export class HttpError extends Error {
     statusCode;
-    publicCode;
-    constructor(statusCode, message, publicCode) {
+    constructor(statusCode, message) {
         super(message);
         this.statusCode = statusCode;
-        // Code stable exposé au front (ex. TOTP_ENROLLMENT_REQUIRED) ; jamais de détail interne.
-        if (publicCode) this.publicCode = publicCode;
     }
 }
 export function found(item) { if (!item)

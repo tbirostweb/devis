@@ -1,4 +1,3 @@
-import { scheduleRetention } from './retention.js';
 import 'dotenv/config';
 import Fastify from 'fastify';
 import cookie from '@fastify/cookie';
@@ -12,10 +11,7 @@ import { existsSync } from 'node:fs';
 import { ZodError } from 'zod';
 import { Prisma } from '@prisma/client';
 import { db } from './db.js';
-import { safeError } from './redact.js';
-import { totpKey } from './secrets.js';
 import { ibanKey } from './iban.js';
-import { parseTrustProxy } from './config.js';
 import { auth } from './auth.js';
 import { records } from './routes/records.js';
 import { commercial } from './routes/commercial.js';
@@ -30,16 +26,10 @@ if (prod && (!process.env.APP_ORIGIN?.startsWith('https://') || !process.env.DAT
     throw new Error('APP_ORIGIN HTTPS et DATABASE_URL sont obligatoires en production.');
 if (prod && process.env.ADMIN_PASSWORD && process.env.INITIALIZE_ADMIN !== 'true')
     console.warn('AVERTISSEMENT : ADMIN_PASSWORD est encore présent alors que INITIALIZE_ADMIN n’est pas actif. Retirez ce secret des variables d’environnement.');
-// Clé de chiffrement des secrets 2FA : obligatoire en production (la 2FA administrateur est imposée).
-if (prod && !totpKey())
-    throw new Error('TOTP_ENCRYPTION_KEY (32 octets, base64 ou hex) est obligatoire en production.');
 // Clé de chiffrement des IBAN : également obligatoire en production (échec au démarrage plutôt qu'à l'usage).
 if (prod)
     ibanKey();
-const trustProxy = parseTrustProxy(process.env.TRUST_PROXY);
-if (prod && trustProxy === true)
-    throw new Error('TRUST_PROXY=true fait confiance à toute adresse (X-Forwarded-For falsifiable) : indiquez l’IP/CIDR du proxy Traefik/Dokploy ou un nombre de sauts.');
-const app = Fastify({ logger: { level: prod ? 'info' : 'warn', redact: ['req.headers.cookie', 'req.headers.authorization', 'req.headers.x-csrf-token'] }, trustProxy, bodyLimit: 512 * 1024 });
+const app = Fastify({ logger: { level: prod ? 'info' : 'warn', redact: ['req.headers.cookie', 'req.headers.authorization', 'req.headers.x-csrf-token'] }, trustProxy: process.env.TRUST_PROXY === 'true', bodyLimit: 512 * 1024 });
 await app.register(cookie);
 app.addHook('onRoute', options => { if (options.url.startsWith('/api/')) options.compress = false; });
 await app.register(compress, { global: true, globalDecompression: false });
@@ -59,8 +49,8 @@ app.setErrorHandler((error, req, reply) => {
     }
     const status = error.statusCode ?? 500;
     if (status >= 500)
-        req.log.error({ err: safeError(error) }, 'Erreur serveur');
-    reply.code(status).send({ message: status >= 500 ? 'Une erreur est survenue. Réessayez.' : error.message, ...(status < 500 && error.publicCode ? { code: error.publicCode } : {}) });
+        req.log.error(error);
+    reply.code(status).send({ message: status >= 500 ? 'Une erreur est survenue. Réessayez.' : error.message });
 });
 app.addHook('onSend', async (req, reply, payload) => { reply.header('X-Robots-Tag', 'noindex, nofollow'); if (req.url.startsWith('/api/'))
     reply.header('Cache-Control', 'no-store'); return payload; });
@@ -86,5 +76,4 @@ if (existsSync(resolve('dist/index.html'))) {
 for (const signal of ['SIGTERM', 'SIGINT'])
     process.on(signal, async () => { await app.close(); await db.$disconnect(); process.exit(0); });
 await app.listen({ port: Number(process.env.PORT || 3001), host: prod ? '0.0.0.0' : '127.0.0.1' });
-scheduleRetention(db, app.log);
 app.log.info('Birostweb API démarrée');
